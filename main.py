@@ -166,6 +166,10 @@ def init_db():
         c.execute("ALTER TABLE user_limits ADD COLUMN compression_level INTEGER DEFAULT 0")
     except Exception:
         pass
+    try:
+        c.execute("ALTER TABLE user_limits ADD COLUMN max_files_per_zip INTEGER DEFAULT 0")
+    except Exception:
+        pass
 
     # Yangi standartlarni yuklash (admin panel orqali o'zgartirilgan bo'lishi mumkin emas, shuning uchun o'zgarmas)
     # Ammo global ozgaruvchilarni joriy holatini saqlaymiz
@@ -307,6 +311,35 @@ def reset_all_limits():
 def reset_user_limits(uid: int):
     c = get_db()
     c.execute("DELETE FROM user_limits WHERE telegram_id=?", (uid,))
+    c.commit(); db_sync()
+    
+def get_user_max_files(uid: int) -> int:
+    """Foydalanuvchi uchun bir ZIPdagi maksimal fayl sonini qaytaradi."""
+    r = get_db().execute(
+        "SELECT max_files_per_zip FROM user_limits WHERE telegram_id=?", (uid,)
+    ).fetchone()
+    # Agar 0 yoki NULL bo‘lsa, global MAX_FILES qaytariladi
+    if r and r[0] and r[0] > 0:
+        return r[0]
+    return MAX_FILES
+
+def set_user_max_files(uid: int, limit: int):
+    """Foydalanuvchi uchun fayl soni limitini o‘rnatish."""
+    c = get_db()
+    existing = c.execute("SELECT telegram_id FROM user_limits WHERE telegram_id=?", (uid,)).fetchone()
+    if existing:
+        c.execute("UPDATE user_limits SET max_files_per_zip=? WHERE telegram_id=?", (limit, uid))
+    else:
+        c.execute("INSERT INTO user_limits(telegram_id,max_zips_day,max_storage_bytes,compression_level,max_files_per_zip) VALUES(?,?,?,?,?)",
+                  (uid, DEFAULT_ZIPS_DAY, DEFAULT_STORAGE, DEFAULT_COMPRESSION, limit))
+    c.commit(); db_sync()
+
+def set_all_users_max_files(limit: int):
+    """Hamma foydalanuvchilar uchun fayl limitini yangilash."""
+    c = get_db()
+    c.execute("UPDATE user_limits SET max_files_per_zip=?", (limit,))
+    global MAX_FILES
+    MAX_FILES = limit
     c.commit(); db_sync()
 
 # ── Channels ─────────────────────────────────────────────
@@ -580,7 +613,7 @@ def tx(uid: int, key: str, **kw) -> str:
     lang = get_lang(uid) or "uz"
     text = TEXTS.get(lang, TEXTS["uz"]).get(key, key)
     if 'max_files' not in kw:
-        kw['max_files'] = MAX_FILES
+        kw['max_files'] = get_user_max_files(uid) if uid else MAX_FILES
     return text.format(**kw)
 
 def main_keyboard(uid: int):
@@ -932,15 +965,17 @@ async def _send_excess_msg(client, chat_id: int, uid: int):
         return
     sm   = user_status_msg.get(uid)
     lang = get_lang(uid) or "uz"
+    user_max = get_user_max_files(uid)
     if lang == "uz":
         text = (f"✅ *{accepted} ta fayl* qabul qilindi!\n"
-                f"❌ *{rejected} ta fayl* qabul qilinmadi (25 ta limit).\n\n"
+                f"❌ *{rejected} ta fayl* qabul qilinmadi ({user_max} ta limit).\n\n"
                 f"👇 ZIP yasash tugmasini bosing:")
     else:
         text = (f"✅ *{accepted} file(s)* received!\n"
-                f"❌ *{rejected} file(s)* rejected (25 file limit).\n\n"
+                f"❌ *{rejected} file(s)* rejected ({user_max} file limit).\n\n"
                 f"👇 Press Create ZIP when ready:")
     markup = InlineKeyboardMarkup([[InlineKeyboardButton(tx(uid, "ready_btn"), callback_data="zip_now")]])
+
     if sm is None:
         try:
             sent = await client.send_message(chat_id, text, parse_mode=enums.ParseMode.MARKDOWN, reply_markup=markup)
@@ -1007,7 +1042,7 @@ async def receive_file(client, message: Message, obj, filename: str):
         used_now = disk_used(uid) + user_reserved_bytes.get(uid, 0)
         cur_cnt  = file_count(uid) + user_downloading.get(uid, 0)
 
-        if cur_cnt >= MAX_FILES:
+        if cur_cnt >= get_user_max_files(uid):
             user_excess[uid] = user_excess.get(uid, 0) + 1
             schedule_task(user_debounce, uid, _send_excess_msg(client, message.chat.id, uid))
         elif used_now + fsize > max_storage:
@@ -1639,6 +1674,36 @@ async def on_text(client, message):
                 await message.reply("❌ Noto'g'ri ID.")
             return
 
+         # ═══════════════════════════════════════════════════
+        # YANGI: fayl limiti uchun qo‘shimchalar SHU YERGA
+        # ═══════════════════════════════════════════════════
+
+        if action == "set_file_limit":
+            parts = raw.split()
+            if len(parts) < 2:
+                await message.reply("❌ Format: `USER_ID LIMIT`")
+                return
+            try:
+                target_id = int(parts[0])
+                limit_val = int(parts[1])
+                set_user_max_files(target_id, limit_val)
+                await message.reply(f"✅ `{target_id}` uchun fayl limiti: *{limit_val}* ta")
+            except Exception:
+                await message.reply("❌ Xato. Format: `USER_ID LIMIT`")
+            return
+
+        if action == "set_all_file_limit":
+            try:
+                limit_val = int(raw)
+                set_all_users_max_files(limit_val)
+                await message.reply(f"✅ Hamma uchun fayl limiti: *{limit_val}* ta")
+            except Exception:
+                await message.reply("❌ Butun son yuboring")
+            return
+
+        # ═══════════════════════════════════════════════════
+        # YANGI QO‘SHIMCHALAR TUGADI
+        # ═══════════════════════════════════════════════════
         # Generic user lookup actions (ban, unban, info, clear)
         try:
             target_id = int(re.search(r"\d+", raw).group())
@@ -1928,6 +1993,8 @@ async def adm_limits(client, call):
             [InlineKeyboardButton("📦 Hamma uchun ZIP limiti", callback_data="adm_all_zip_limit"),
              InlineKeyboardButton("💾 Hamma uchun xotira limiti", callback_data="adm_all_storage_limit")],
             [InlineKeyboardButton("🔄 Hamma uchun standartga qaytarish", callback_data="adm_all_reset")],
+            [InlineKeyboardButton("📎 Foydalanuvchi fayl limiti", callback_data="adm_set_file_limit"),
+            InlineKeyboardButton("📎 Hamma uchun fayl limiti", callback_data="adm_all_file_limit")],
         ]),
     )
     await call.answer()
@@ -2010,6 +2077,20 @@ async def adm_all_storage_limit(client, call):
 async def cb_all_reset(client, call):
     reset_all_limits()
     await call.message.reply("✅ Hamma foydalanuvchi limitlari standartga qaytarildi.",
+                             parse_mode=enums.ParseMode.MARKDOWN)
+    await call.answer()
+
+@app.on_callback_query(admin_filter & filters.create(lambda _, __, q: q.data == "adm_set_file_limit"))
+async def adm_set_file_limit(client, call):
+    waiting_for_user_id[ADMIN_ID] = "set_file_limit"
+    await call.message.reply("📎 Fayl limitini o‘zgartirish uchun `USER_ID LIMIT` yuboring:\nMisol: `123456789 40`",
+                             parse_mode=enums.ParseMode.MARKDOWN)
+    await call.answer()
+
+@app.on_callback_query(admin_filter & filters.create(lambda _, __, q: q.data == "adm_all_file_limit"))
+async def adm_all_file_limit(client, call):
+    waiting_for_user_id[ADMIN_ID] = "set_all_file_limit"
+    await call.message.reply("📎 Hamma foydalanuvchilar uchun yangi fayl limitini yuboring (butun son):",
                              parse_mode=enums.ParseMode.MARKDOWN)
     await call.answer()
 #//////////////////////////////////////////////////////////////////////////////////////////
