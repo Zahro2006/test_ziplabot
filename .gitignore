@@ -1,0 +1,6 @@
+user_files/
+bot.db
+*.session
+*.session-journal
+__pycache__/
+*.pyc
