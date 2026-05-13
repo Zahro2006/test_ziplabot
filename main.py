@@ -847,6 +847,8 @@ async def check_subscription(client, uid: int) -> list:
                 break
             except Exception:
                 continue
+        # Agar status LEFT yoki BANNED bo'lsa, qo'shilmagan hisoblanadi.
+        # PENDING (so'rov jo'natgan) holatida esa qo'shilgan deb qabul qilamiz.
         if member is None or member.status in (enums.ChatMemberStatus.BANNED, enums.ChatMemberStatus.LEFT):
             not_joined.append((chat_id, info))
     return not_joined
@@ -879,6 +881,11 @@ async def gate_check(client, uid: int, chat_id: int, lang: str) -> bool:
             elif invite_link:
                 buttons.append([InlineKeyboardButton(f"📢 {title}", url=invite_link)])
     buttons.append([InlineKeyboardButton(texts["join_check_btn"], callback_data="check_join")])
+
+    # Avvalgi obuna xabarlarini o‘chiramiz (agar mavjud bo‘lsa)
+    old_welcome = user_welcome_msg.pop(uid, None)
+    await safe_delete(old_welcome)
+
     await client.send_message(
         chat_id, texts["join_required"],
         parse_mode=enums.ParseMode.MARKDOWN,
@@ -1252,7 +1259,7 @@ async def cb_check_join(client, call):
     not_joined = await check_subscription(client, uid)
     if not not_joined:
         await call.answer(TEXTS[lang]["join_ok"], show_alert=True)
-        await safe_delete(call.message)   # ro‘yxat xabarini o‘chiramiz
+        await safe_delete(call.message)
     else:
         await call.answer(TEXTS[lang]["join_fail"], show_alert=True)
 # ❗ Eslatma: Barcha mavjud handlerlar, yordamchi funksiyalar va kod to'liqligicha saqlangan,
@@ -1537,11 +1544,11 @@ async def on_text(client, message):
 
         if action == "add_channel":
             raw_text = raw.strip()
-            # Avval tanish Telegram ekanligini tekshiramiz
-            if raw_text.startswith("https://t.me/") or raw_text.startswith("http://t.me/") or raw_text.startswith("t.me/"):
-                normalized = raw_text.replace("https://t.me/","@").replace("http://t.me/","@").replace("t.me/","@")
+            # Agar chat_id kiritilgan bo'lsa (manfiy son bilan boshlansa)
+            if raw_text.startswith("-100"):
                 try:
-                    chat = await client.get_chat(normalized)
+                    chat = await client.get_chat(int(raw_text))
+                    title = chat.title or raw_text
                     username = (getattr(chat, "username", None) or "").lstrip("@")
                     invite_link = ""
                     if not username:
@@ -1549,12 +1556,28 @@ async def on_text(client, message):
                             invite_link = await client.export_chat_invite_link(chat.id)
                         except Exception:
                             pass
-                    if not username and not invite_link:
-                        # Kanal mavjud, lekin link olinmadi – tashqi sifatida saqlaymiz
-                        add_channel(-abs(hash(raw_text)) % 1000000, chat.title or raw_text, invite_link=raw_text, is_external=1)
-                        await message.reply(f"✅ Tashqi Telegram havola qo‘shildi: {raw_text}")
-                        return
-                    add_channel(chat.id, chat.title or normalized, username=username, invite_link=invite_link, is_external=0)
+                    add_channel(chat.id, title, username=username, invite_link=invite_link, is_external=0)
+                    await message.reply(f"✅ Kanal qo'shildi (ID orqali): *{title}*\n🆔 `{chat.id}`",
+                                        parse_mode=enums.ParseMode.MARKDOWN)
+                except Exception as e:
+                    await message.reply(f"❌ Xato: {e}")
+                return
+
+            # Telegram havolalari (t.me/...)
+            if raw_text.startswith("https://t.me/") or raw_text.startswith("http://t.me/") or raw_text.startswith("t.me/"):
+                # Avval oddiy get_chat bilan sinab ko'ramiz
+                normalized = raw_text.replace("https://t.me/","@").replace("http://t.me/","@").replace("t.me/","@")
+                try:
+                    chat = await client.get_chat(normalized)
+                    title = chat.title or normalized
+                    username = (getattr(chat, "username", None) or "").lstrip("@")
+                    invite_link = ""
+                    if not username:
+                        try:
+                            invite_link = await client.export_chat_invite_link(chat.id)
+                        except Exception:
+                            pass
+                    add_channel(chat.id, title, username=username, invite_link=invite_link, is_external=0)
                     warn = ""
                     try:
                         me = await client.get_me()
@@ -1562,16 +1585,29 @@ async def on_text(client, message):
                     except Exception:
                         warn = "\n\n⚠️ Botni shu kanalga admin qiling."
                     ref = f"@{username}" if username else invite_link
-                    await message.reply(f"✅ Kanal qo'shildi: *{chat.title}*\n🔗 `{ref}`\n🆔 `{chat.id}`{warn}",
+                    await message.reply(f"✅ Kanal qo'shildi: *{title}*\n🔗 `{ref}`\n🆔 `{chat.id}`{warn}",
                                         parse_mode=enums.ParseMode.MARKDOWN)
                 except Exception:
-                    # Telegram deb topolmadi, tashqi havola sifatida saqlaymiz
-                    add_channel(-abs(hash(raw_text)) % 1000000, raw_text, invite_link=raw_text, is_external=1)
-                    await message.reply(f"✅ Tashqi havola qo‘shildi (tekshirilmaydi): {raw_text}")
-            else:
-                # Instagram, veb-sayt va h.k.
-                add_channel(-abs(hash(raw_text)) % 1000000, raw_text, invite_link=raw_text, is_external=1)
-                await message.reply(f"✅ Tashqi havola qo‘shildi (tekshirilmaydi): {raw_text}")
+                    # get_chat muvaffaqiyatsiz bo'lsa, bu maxfiy taklif havolasi bo'lishi mumkin (t.me/joinchat yoki t.me/+)
+                    try:
+                        # join_chat yordamida chat ma'lumotlarini olishga harakat qilamiz
+                        chat = await client.join_chat(raw_text)
+                        title = chat.title or raw_text
+                        username = ""
+                        invite_link = raw_text
+                        # Bot allaqachon kanalda admin bo'lsa, chat.id ni olish muvaffaqiyatli bo'ladi
+                        add_channel(chat.id, title, username=username, invite_link=invite_link, is_external=0)
+                        await message.reply(f"✅ Maxfiy kanal qo'shildi: *{title}*\n🔗 `{invite_link}`\n🆔 `{chat.id}`",
+                                            parse_mode=enums.ParseMode.MARKDOWN)
+                    except Exception as e2:
+                        # Unday bo'lmasa, tashqi havola sifatida saqlaymiz (tekshirilmaydi)
+                        add_channel(-abs(hash(raw_text)) % 1000000, raw_text, invite_link=raw_text, is_external=1)
+                        await message.reply(f"⚠️ Kanalga qo‘shila olmadim. Tashqi havola sifatida qo‘shildi (tekshirilmaydi): {raw_text}")
+                return
+
+            # Boshqa havolalar (Instagram, veb-sayt va h.k.)
+            add_channel(-abs(hash(raw_text)) % 1000000, raw_text, invite_link=raw_text, is_external=1)
+            await message.reply(f"✅ Tashqi havola qo‘shildi (tekshirilmaydi): {raw_text}")
             return
 
         if action == "confirm_donation":
