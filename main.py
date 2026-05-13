@@ -170,6 +170,10 @@ def init_db():
         c.execute("ALTER TABLE user_limits ADD COLUMN max_files_per_zip INTEGER DEFAULT 0")
     except Exception:
         pass
+    try:
+        c.execute("ALTER TABLE channels ADD COLUMN is_external INTEGER DEFAULT 0")
+    except Exception:
+        pass
 
     # Yangi standartlarni yuklash (admin panel orqali o'zgartirilgan bo'lishi mumkin emas, shuning uchun o'zgarmas)
     # Ammo global ozgaruvchilarni joriy holatini saqlaymiz
@@ -345,19 +349,23 @@ def set_all_users_max_files(limit: int):
 # ── Channels ─────────────────────────────────────────────
 def _load_channels():
     global required_channels
-    rows = get_db().execute("SELECT chat_id, title, username, invite_link FROM channels").fetchall()
-    required_channels = {
-        r[0]: {"title": r[1] or "", "username": (r[2] or "").lstrip("@"), "invite_link": r[3] or ""}
-        for r in rows
-    }
+    rows = get_db().execute("SELECT chat_id, title, username, invite_link, COALESCE(is_external,0) FROM channels").fetchall()
+    required_channels = {}
+    for r in rows:
+        required_channels[r[0]] = {
+            "title": r[1] or "",
+            "username": (r[2] or "").lstrip("@"),
+            "invite_link": r[3] or "",
+            "is_external": r[4]
+        }
 
-def add_channel(chat_id: int, title: str, username: str = "", invite_link: str = ""):
+def add_channel(chat_id: int, title: str, username: str = "", invite_link: str = "", is_external: int = 0):
     username = (username or "").lstrip("@")
     c = get_db()
-    c.execute("INSERT OR REPLACE INTO channels(chat_id,title,username,invite_link) VALUES(?,?,?,?)",
-              (chat_id, title, username, invite_link))
+    c.execute("INSERT OR REPLACE INTO channels(chat_id,title,username,invite_link,is_external) VALUES(?,?,?,?,?)",
+              (chat_id, title, username, invite_link, is_external))
     c.commit(); db_sync()
-    required_channels[chat_id] = {"title": title, "username": username, "invite_link": invite_link or ""}
+    required_channels[chat_id] = {"title": title, "username": username, "invite_link": invite_link, "is_external": is_external}
 
 def remove_channel(chat_id: int):
     c = get_db(); c.execute("DELETE FROM channels WHERE chat_id=?", (chat_id,))
@@ -825,6 +833,8 @@ def get_user_file_lock(uid: int) -> asyncio.Lock:
 async def check_subscription(client, uid: int) -> list:
     not_joined = []
     for chat_id, info in required_channels.items():
+        if info.get("is_external", 0) == 1:
+            continue  # tashqi havolalar tekshirilmaydi
         refs = []
         username = (info.get("username") or "").lstrip("@")
         if username:
@@ -845,18 +855,29 @@ async def gate_check(client, uid: int, chat_id: int, lang: str) -> bool:
     if not required_channels:
         return True
     not_joined = await check_subscription(client, uid)
-    if not not_joined:
+    # Agar barcha tekshiriladigan kanallarga a'zo bo'lsa, True qaytaramiz
+    all_telegram_joined = True
+    for cid, info in required_channels.items():
+        if info.get("is_external", 0) == 0 and any(cid == x[0] for x in not_joined):
+            all_telegram_joined = False
+            break
+    if all_telegram_joined:
         return True
+
     texts = TEXTS.get(lang, TEXTS["uz"])
     buttons = []
-    for _, info in not_joined:
-        username = (info.get("username") or "").lstrip("@")
-        invite_link = info.get("invite_link") or ""
-        title = info.get("title") or "Kanal"
-        if username:
-            buttons.append([InlineKeyboardButton(f"📢 @{username}", url=f"https://t.me/{username}")])
-        elif invite_link:
-            buttons.append([InlineKeyboardButton(f"📢 {title}", url=invite_link)])
+    for cid, info in required_channels.items():
+        if info.get("is_external", 0) == 1:
+            # Tashqi havola – oddiy URL tugma
+            buttons.append([InlineKeyboardButton(f"🔗 {info['title']}", url=info.get("invite_link", "https://t.me"))])
+        else:
+            username = (info.get("username") or "").lstrip("@")
+            invite_link = info.get("invite_link") or ""
+            title = info.get("title") or "Kanal"
+            if username:
+                buttons.append([InlineKeyboardButton(f"📢 @{username}", url=f"https://t.me/{username}")])
+            elif invite_link:
+                buttons.append([InlineKeyboardButton(f"📢 {title}", url=invite_link)])
     buttons.append([InlineKeyboardButton(texts["join_check_btn"], callback_data="check_join")])
     await client.send_message(
         chat_id, texts["join_required"],
@@ -1231,6 +1252,7 @@ async def cb_check_join(client, call):
     not_joined = await check_subscription(client, uid)
     if not not_joined:
         await call.answer(TEXTS[lang]["join_ok"], show_alert=True)
+        await safe_delete(call.message)   # ro‘yxat xabarini o‘chiramiz
     else:
         await call.answer(TEXTS[lang]["join_fail"], show_alert=True)
 # ❗ Eslatma: Barcha mavjud handlerlar, yordamchi funksiyalar va kod to'liqligicha saqlangan,
@@ -1514,31 +1536,42 @@ async def on_text(client, message):
         raw    = text
 
         if action == "add_channel":
-            normalized = raw.replace("https://t.me/","@").replace("http://t.me/","@").replace("t.me/","@")
-            try:
-                chat     = await client.get_chat(normalized)
-                username = (getattr(chat, "username", None) or "").lstrip("@")
-                invite_link = ""
-                if not username:
-                    try:
-                        invite_link = await client.export_chat_invite_link(chat.id)
-                    except Exception:
-                        pass
-                if not username and not invite_link:
-                    await message.reply("❌ Kanal public emas va invite link ham olinmadi.")
-                    return
-                add_channel(chat.id, chat.title or normalized, username=username, invite_link=invite_link)
-                warn = ""
+            raw_text = raw.strip()
+            # Avval tanish Telegram ekanligini tekshiramiz
+            if raw_text.startswith("https://t.me/") or raw_text.startswith("http://t.me/") or raw_text.startswith("t.me/"):
+                normalized = raw_text.replace("https://t.me/","@").replace("http://t.me/","@").replace("t.me/","@")
                 try:
-                    me = await client.get_me()
-                    await client.get_chat_member(chat.id, me.id)
+                    chat = await client.get_chat(normalized)
+                    username = (getattr(chat, "username", None) or "").lstrip("@")
+                    invite_link = ""
+                    if not username:
+                        try:
+                            invite_link = await client.export_chat_invite_link(chat.id)
+                        except Exception:
+                            pass
+                    if not username and not invite_link:
+                        # Kanal mavjud, lekin link olinmadi – tashqi sifatida saqlaymiz
+                        add_channel(-abs(hash(raw_text)) % 1000000, chat.title or raw_text, invite_link=raw_text, is_external=1)
+                        await message.reply(f"✅ Tashqi Telegram havola qo‘shildi: {raw_text}")
+                        return
+                    add_channel(chat.id, chat.title or normalized, username=username, invite_link=invite_link, is_external=0)
+                    warn = ""
+                    try:
+                        me = await client.get_me()
+                        await client.get_chat_member(chat.id, me.id)
+                    except Exception:
+                        warn = "\n\n⚠️ Botni shu kanalga admin qiling."
+                    ref = f"@{username}" if username else invite_link
+                    await message.reply(f"✅ Kanal qo'shildi: *{chat.title}*\n🔗 `{ref}`\n🆔 `{chat.id}`{warn}",
+                                        parse_mode=enums.ParseMode.MARKDOWN)
                 except Exception:
-                    warn = "\n\n⚠️ Botni shu kanalga admin qiling."
-                ref = f"@{username}" if username else invite_link
-                await message.reply(f"✅ Kanal qo'shildi: *{chat.title}*\n🔗 `{ref}`\n🆔 `{chat.id}`{warn}",
-                                    parse_mode=enums.ParseMode.MARKDOWN)
-            except Exception:
-                await message.reply("❌ Kanal topilmadi.", parse_mode=enums.ParseMode.MARKDOWN)
+                    # Telegram deb topolmadi, tashqi havola sifatida saqlaymiz
+                    add_channel(-abs(hash(raw_text)) % 1000000, raw_text, invite_link=raw_text, is_external=1)
+                    await message.reply(f"✅ Tashqi havola qo‘shildi (tekshirilmaydi): {raw_text}")
+            else:
+                # Instagram, veb-sayt va h.k.
+                add_channel(-abs(hash(raw_text)) % 1000000, raw_text, invite_link=raw_text, is_external=1)
+                await message.reply(f"✅ Tashqi havola qo‘shildi (tekshirilmaydi): {raw_text}")
             return
 
         if action == "confirm_donation":
@@ -1903,8 +1936,8 @@ async def adm_disk(client, call):
 async def adm_channels(client, call):
     channels = get_channels()
     text = "📢 *Majburiy kanallar:*\n\n" + "\n".join(
-        f"• {info['title']} — `{'@'+info['username'] if info.get('username') else info.get('invite_link','—')}` (`{cid}`)"
-        for cid, info in channels.items()
+    f"• {info['title']} {'🔗' if info.get('is_external',0)==1 else '📢'} — `{info.get('invite_link','—')}` (`{cid}`)"
+    for cid, info in channels.items()
     ) if channels else "📢 Hozircha kanal qo'shilmagan."
     btns = [[InlineKeyboardButton(f"🗑 {info['title']} o'chirish", callback_data=f"adm_rmchan_{cid}")]
             for cid, info in channels.items()]
